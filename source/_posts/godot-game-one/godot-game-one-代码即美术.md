@@ -18,16 +18,16 @@ top_img: false
 
 {% mermaid %}
 graph LR
-    A[游戏启动] --> B[SpriteFactory 初始化]
-    B --> C[生成玩家飞船]
-    B --> D[生成敌人 x3 类型]
-    B --> E[生成Boss x5 变体]
-    B --> F[生成子弹/爆炸/陨石]
-    C --> G[缓存为 ImageTexture]
+    A["游戏启动"] --> B["SpriteFactory 初始化"]
+    B --> C["生成玩家飞船"]
+    B --> D["生成敌人 x3 类型"]
+    B --> E["生成 Boss x5 变体"]
+    B --> F["生成子弹/爆炸/陨石"]
+    C --> G["缓存为 ImageTexture"]
     D --> G
     E --> G
     F --> G
-    G --> H[运行时直接引用 - 零开销]
+    G --> H["运行时直接引用 零开销"]
 {% endmermaid %}
 
 ## SpriteFactory：898 行代码画出整个游戏
