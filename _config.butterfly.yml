@@ -58,9 +58,9 @@ share:
 footer:
   owner:
     enable: true
-    since: 2026
+    since: 2025
   copyright: true
-  custom_text: <a href="https://july-x.github.io//">Powered By AI.</a>!
+  custom_text: <a href="https://july-x.github.io//">Powered By AI.</a>
 
 busuanzi:
   site_uv: false
