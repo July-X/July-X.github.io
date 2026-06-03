@@ -179,6 +179,6 @@ google_adsense:
   auto_ads: true
   js: https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js
   client: ca-pub-4951549986720325
-  enable_page_level_ads: true
+  enable_page_level_ads: false
 
 
