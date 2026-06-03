@@ -5,15 +5,6 @@ avatar:
   img: /img/avatar.png
   effect: false
 
-navbar:
-  logo_img: /img/logo.png
-  menu:
-    首页: / || fas fa-home
-    归档: /archives/ || fas fa-archive
-    标签: /tags/ || fas fa-tags
-    分类: /categories/ || fas fa-folder-open
-    关于: /about/ || fas fa-user
-
 index_format: 3
 pagination_style: 2
 
