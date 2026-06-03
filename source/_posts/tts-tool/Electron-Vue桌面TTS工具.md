@@ -34,7 +34,7 @@ graph TD
     end
 {% endmermaid %}
 
-项目基于 `electron-egg` 框架，采用 Controller → Service 的 MVC 分层。前后端通过 IPC 通信，渲染进程不直接访问 Node.js API，保证安全性。
+项目基于 `electron-egg` 框架，采用 Controller → Service 的 MVC 分层。前后端通过 IPC 通信，渲染进程通过 `contextBridge` 暴露的 `ipcRenderer` 访问 Node.js API。
 
 ## 为什么选 Electron + Vue？
 
@@ -51,53 +51,59 @@ graph TD
 Electron 的安全模型要求渲染进程不能直接访问 Node.js API。项目通过 `contextBridge` 暴露安全的 IPC 接口：
 
 ```javascript
-// electron/preload/bridge.js
+// app/electron/preload/bridge.js — 直接暴露整个 ipcRenderer 对象
+const { contextBridge, ipcRenderer } = require('electron')
+
 contextBridge.exposeInMainWorld('electron', {
-  ipcRenderer: {
-    invoke: (channel, ...args) => ipcRenderer.invoke(channel, ...args),
-    on: (channel, callback) => ipcRenderer.on(channel, callback)
-  }
+  ipcRenderer: ipcRenderer,
 })
 ```
 
-渲染进程通过封装的 `ipcRenderer` 调用主进程，超时机制防止请求挂起：
+渲染进程通过封装的 `invoke` 函数调用主进程，超时机制防止请求挂起：
 
 ```javascript
-// frontend/src/utils/ipcRenderer.js
-function invokeWithTimeout(channel, args, timeout = 30000) {
-  return Promise.race([
-    window.electron.ipcRenderer.invoke(channel, args),
-    new Promise((_, reject) =>
-      setTimeout(() => reject(new Error('IPC timeout')), timeout)
-    )
-  ])
+// app/frontend/src/utils/ipcRenderer.js
+const Renderer = (window.require && window.require('electron')) || window.electron || {};
+const ipc = Renderer.ipcRenderer || undefined;
+
+async function invoke(channel, params, timeout = 60000) {
+  if (!ipc?.invoke) {
+    throw new Error('IPC not available: not in Electron environment')
+  }
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new Error(`IPC timeout: ${channel} (${timeout}ms)`))
+    }, timeout)
+    ipc.invoke(channel, params)
+      .then(result => { clearTimeout(timer); resolve(result) })
+      .catch(error => { clearTimeout(timer); reject(error) })
+  })
 }
 ```
+
+注意：超时默认 60 秒而非 30 秒，且 `bridge.js` 直接暴露整个 `ipcRenderer` 对象，不做方法包装。
 
 ## TTS 引擎接入
 
-小米 MiMo-V2.5-TTS 引擎通过 REST API 接入。Service 层封装了 API 调用、重试和缓存：
+小米 MiMo-V2.5-TTS 引擎通过 REST API 接入。Service 层封装了 API 调用、重试和缓存（以下为简化示意，实际实现包含完整的错误处理和重试逻辑）：
 
 ```javascript
-// electron/service/tts.js
-async synthesize(text, voice, options) {
-  const cacheKey = generateCacheKey(text, voice, options)
-  if (this.cache.has(cacheKey)) {
-    return this.cache.get(cacheKey)  // 命中缓存
-  }
-  const audioBuffer = await this.callAPI(text, voice, options)
-  this.cache.set(cacheKey, audioBuffer)
-  return audioBuffer
+// app/electron/service/tts.js — 简化示意
+async _callApi(text, voiceId, speed, styleDescription, exportFormat, apiBase, apiKey, params) {
+  // 实际实现包含重试机制、错误处理和音频格式转换
 }
 ```
 
-批量生成时，通过 `Promise.allSettled` 并发调用，单条失败不影响整体：
+缓存键用 djb2 哈希算法，由 `_buildCacheKey(text, voiceId, speed, styleDesc, format, useVoiceDesign, useVoiceClone, provider)` 构建。
+
+批量生成时，通过信号量（`_acquireSlot` / `_releaseSlot`）控制并发数，单条失败不影响整体：
 
 ```javascript
-async batchSynthesize(texts, voice, options) {
-  const tasks = texts.map(text => this.synthesize(text, voice, options))
-  const results = await Promise.allSettled(tasks)
-  return results.map(r => r.status === 'fulfilled' ? r.value : null)
+// frontend/src/views/mimo/store/ttsStore.js — 简化示意
+async generateAllLines(charId) {
+  // 用信号量控制并发，逐行调用 TTS
+  // await _acquireSlot()
+  // try { ... } finally { _releaseSlot() }
 }
 ```
 
