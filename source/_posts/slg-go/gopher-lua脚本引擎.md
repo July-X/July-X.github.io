@@ -1,5 +1,5 @@
 ---
-title: "gopher-lua：不重启就改游戏逻辑的脚本引擎"
+title: "gopher-lua：脚本引擎的集成、并发和热更新"
 date: 2025-06-04 14:30:00
 tags:
   - 游戏后端
@@ -13,288 +13,190 @@ top_img: false
 
 <!-- more -->
 
-SLG 游戏的策划需求变化频繁——调整建筑升级时间、修改资源产出比例、改战斗公式。如果每次改动都要重新编译部署 Go 服务，策划会疯，运维也会疯。`slg-go` 用 `gopher-lua` 嵌入 Lua 脚本引擎，让游戏逻辑可以热更新。
+`slg-go` 用 `gopher-lua` 做了两件事：战力计算和等级计算。目前还没有实现运行时热更新——改脚本还是得重启服务。这篇文章记录我们怎么集成 gopher-lua、踩了哪些坑、以及热更新要做的话该怎么设计。
 
 ## 为什么选 Lua？
 
-| 语言 | 嵌入难度 | 性能 | 热更新 | 生态 |
-|------|----------|------|--------|------|
-| Lua | 低（gopher-lua） | 中 | 原生支持 | 游戏行业标准 |
-| JavaScript | 中（goja） | 中高 | 需额外机制 | Web 生态 |
-| Python | 高（嵌入 CPython） | 低 | 受 GIL 限制 | ML 生态 |
+| 语言 | 嵌入难度 | 性能 | 热更新潜力 | 游戏行业生态 |
+|------|----------|------|------------|-------------|
+| Lua | 低（gopher-lua） | 中 | 原生支持 | 标准 |
+| JavaScript | 中（goja） | 中高 | 需额外机制 | 非主流 |
+| Python | 高（嵌入 CPython） | 低 | 受 GIL 限制 | 非主流 |
 
-Lua 天生为嵌入设计，`gopher-lua` 是纯 Go 实现，不依赖 CGO，交叉编译无障碍。
+Lua 天生为嵌入设计，`gopher-lua` 是纯 Go 实现，不依赖 CGO，交叉编译无障碍。`go.mod` 里直接 `go get github.com/yuin/gopher-lua` 就行。
 
-## 集成方式
+## 实际的集成方式
+
+项目的 Lua 集成集中在两个计算器：`player_power_lua.go` 和 `player_level_lua.go`。结构一样，以战力计算器为例：
 
 ```go
-// internal/luaenv/loader.go
-type LuaEnv struct {
-    vm *lua.LState
-    mu sync.RWMutex
-}
-
-func New() *LuaEnv {
-    L := lua.NewState(lua.Options{SkipOpenLibs: false})
-    env := &LuaEnv{vm: L}
-    env.registerGoFunctions()
-    return env
-}
-
-func (e *LuaEnv) registerGoFunctions() {
-    // 注册 Go 函数到 Lua 全局表
-    e.vm.SetGlobal("go_log", e.vm.NewFunction(func(L *lua.LState) int {
-        msg := L.CheckString(1)
-        log.Info("[LUA]", msg)
-        return 0
-    }))
+// internal/logic/app/player_power_lua.go
+type LuaPlayerPowerCalculator struct {
+    scriptFile string
+    loadOnce   sync.Once      // 脚本只加载一次
+    loadErr    error
+    script     string         // 脚本内容字符串
+    statePool  sync.Pool      // 复用 LState 实例
 }
 ```
 
-## 热更新：看起来简单，实际上坑很多
-
-上面的 `Reload` 代码是简化版。实际生产环境用这个版本会出问题——我踩过。
-
-### 问题 1：gopher-lua 的 LState 不是线程安全的
-
-`gopher-lua` 的 `LState`（Lua 虚拟机实例）**不是并发安全的**。一个 `LState` 同一时刻只能被一个 goroutine 使用。如果 10 个战斗请求同时调用同一个 `LState`，会 panic 或数据错乱。
-
-最开始的方案是加 `sync.RWMutex`，读请求用 `RLock`，热更新用 `Lock`：
+初始化时用 `sync.Once` 加载脚本内容到内存，后续不再读文件：
 
 ```go
-// ❌ 最初的方案：看起来没问题，实际有坑
-func (e *LuaEnv) CalculateDamage(attacker, defender *Unit) int {
-    e.mu.RLock()
-    defer e.mu.RUnlock()
+func NewLuaPlayerPowerCalculator(scriptDir string) *LuaPlayerPowerCalculator {
+    calc := &LuaPlayerPowerCalculator{
+        scriptFile: filepath.Join(scriptDir, "power.lua"),
+    }
+    calc.statePool = sync.Pool{
+        New: func() interface{} {
+            return lua.NewState()
+        },
+    }
+    return calc
+}
 
-    L := e.vm
-    fn := L.GetGlobal("calculate_damage")
-    L.Push(fn)
-    // ... 调用 Lua 函数
+func (c *LuaPlayerPowerCalculator) ensureLoaded() error {
+    c.loadOnce.Do(func() {
+        data, err := os.ReadFile(c.scriptFile)
+        if err != nil {
+            c.loadErr = err
+            return
+        }
+        c.script = string(data)
+    })
+    return c.loadErr
 }
 ```
 
-坑在哪？`RLock` 允许多个 goroutine 同时读，但 `LState` 不支持并发读。10 个 goroutine 同时 `RLock` 成功，然后同时操作同一个 `LState`，直接炸。
+## LState 不是线程安全的——用 sync.Pool 解决
 
-### 问题 2：正在执行中的请求怎么办？
+这是踩的第一个坑。`gopher-lua` 的 `LState` **不是并发安全的**，一个 `LState` 同一时刻只能被一个 goroutine 使用。
 
-热更新的瞬间，可能有 20 个战斗请求正在旧 VM 里跑。如果直接 `old.Close()`，这些请求会全部崩溃。
+最开始想过加 `sync.RWMutex`，`RLock` 让多个请求同时读。但 `LState` 不支持并发读——10 个 goroutine 同时 `RLock` 成功，然后同时操作同一个 `LState`，直接 panic。
 
-### 最终方案：VM 池 + 引用计数 + 优雅退役
+最终方案是 `sync.Pool`：
 
 ```go
-type LuaEnv struct {
-    current  atomic.Pointer[LuaPool]  // 当前使用的 VM 池
-    mu       sync.Mutex               // 仅 Reload 时用
+func (c *LuaPlayerPowerCalculator) acquireState() *lua.LState {
+    return c.statePool.Get().(*lua.LState)
 }
 
+func (c *LuaPlayerPowerCalculator) releaseState(L *lua.LState) {
+    c.statePool.Put(L)
+}
+```
+
+每次调用从池里取一个 LState，用完放回去。多个请求并发时各自用各自的 LState，互不干扰。Pool 为空时 `New` 函数自动创建新实例。
+
+## 计算流程
+
+```go
+func (c *LuaPlayerPowerCalculator) CalcPlayerPower(...) (int64, error) {
+    if err := c.ensureLoaded(); err != nil {
+        return 0, err
+    }
+
+    L := c.acquireState()
+    defer c.releaseState(L)
+
+    // 用 DoString 而不是 DoFile——脚本已经在内存里了
+    if err := L.DoString(c.script); err != nil {
+        return 0, err
+    }
+
+    fn := L.GetGlobal("calculate_power")
+    // ... 推参数、调用、取返回值
+}
+```
+
+注意是 `DoString` 不是 `DoFile`。脚本内容在 `sync.Once` 时已经读到内存，每次调用直接执行字符串，省掉了重复的文件 IO。
+
+## 优先用 Rust，Lua 做兜底
+
+项目的战力计算有个有趣的架构——优先用 Rust（通过 CGO 调用），Rust 不可用时 fallback 到 Lua：
+
+```go
+// internal/logic/app/game_app.go
+if a.rustPowerCalc != nil {
+    calculated, err = a.rustPowerCalc.CalcPlayerPower(...)
+} else if a.powerCalc != nil {
+    calculated, err = a.powerCalc.CalcPlayerPower(...)
+    logger.Warn("calc player power by lua failed:", ...)
+}
+```
+
+Rust 版本性能更好（gopher-lua 约是 C Lua 的 1/10~1/5），Lua 版本是兜底方案。这种双引擎设计和 game-bass 的 ELO 计算类似——Go 内置兜底，脚本引擎做灵活扩展。
+
+## 热更新：还没做，但可以聊聊怎么设计
+
+目前改脚本需要重启服务。对于战力/等级计算这种低频场景，重启是可以接受的。但如果未来要把更多逻辑放到 Lua（比如战斗公式、建筑规则），就需要热更新了。
+
+### 热更新面临的问题
+
+**问题 1：LState 的并发安全**
+
+热更新的瞬间可能有请求正在用旧 LState。直接 Close 会崩。需要一个机制让旧实例"优雅退役"——等正在执行的请求跑完再销毁。
+
+设计思路：VM 池 + 引用计数。
+
+```go
 type LuaPool struct {
     vms    []*lua.LState
-    idx    uint64                     // 原子递增，轮询分配
-    refCnt atomic.Int64               // 引用计数
-    closed atomic.Bool                // 标记为退役
+    refCnt atomic.Int64
+    closed atomic.Bool
 }
 ```
 
-每次调用从池中取一个 VM，用完归还。这样多个请求可以并发执行，互不干扰：
+每次 acquire 时 refCnt+1，release 时 refCnt-1。Reload 时 atomic.Swap 切换到新池，旧池标记 closed，等 refCnt 归零后 Close 所有 VM。
 
-```go
-func (e *LuaEnv) acquire() *lua.LState {
-    pool := e.current.Load()
-    pool.refCnt.Add(1)
-    i := pool.idx.Add(1) % uint64(len(pool.vms))
-    return pool.vms[i]
-}
+**问题 2：脚本里的全局状态**
 
-func (e *LuaEnv) release(pool *LuaPool) {
-    n := pool.refCnt.Add(-1)
-    // 如果池已退役且引用归零，安全销毁
-    if n <= 0 && pool.closed.Load() {
-        for _, vm := range pool.vms {
-            vm.Close()
-        }
-    }
-}
-```
+Lua 脚本里的模块级变量（`local counter = 0`）热更新后会重置。如果某个逻辑依赖这个计数器，更新后会出 Bug。
 
-### Reload 的正确流程
-
-```go
-func (e *LuaEnv) Reload(scriptPath string) error {
-    e.mu.Lock()
-    defer e.mu.Unlock()
-
-    // 1. 先验证新脚本语法
-    testVM := lua.NewState()
-    if err := testVM.DoFile(scriptPath); err != nil {
-        testVM.Close()
-        return fmt.Errorf("脚本语法错误: %w", err)
-    }
-    testVM.Close()
-
-    // 2. 创建新的 VM 池（4 个 VM 实例）
-    newPool := &LuaPool{vms: make([]*lua.LState, 4)}
-    for i := range newPool.vms {
-        vm := lua.NewState()
-        e.registerGoFunctionsOn(vm)
-        if err := vm.DoFile(scriptPath); err != nil {
-            // 回滚：关闭已创建的 VM
-            for j := 0; j <= i; j++ {
-                newPool.vms[j].Close()
-            }
-            return err
-        }
-        newPool.vms[i] = vm
-    }
-
-    // 3. 原子切换：新请求开始用新 VM
-    oldPool := e.current.Swap(newPool)
-
-    // 4. 标记旧池退役
-    oldPool.closed.Store(true)
-
-    // 5. 等待旧池引用归零后销毁
-    go func() {
-        for oldPool.refCnt.Load() > 0 {
-            time.Sleep(10 * time.Millisecond)
-        }
-        for _, vm := range oldPool.vms {
-            vm.Close()
-        }
-        log.Info("[LUA] 旧 VM 池已安全销毁")
-    }()
-
-    log.Infof("[LUA] 热更新完成: %s", scriptPath)
-    return nil
-}
-```
-
-### 热更新的时间线
+解决方案：Lua 只放无状态的计算逻辑，有状态的数据留在 Go 端管理。
 
 ```
-T+0s     策划调用 /api/admin/reload
-T+0.01s  新脚本语法验证通过
-T+0.05s  4 个新 VM 加载完成
-T+0.05s  atomic.Swap 切换到新 VM 池
-T+0.05s  新请求开始用新 VM
-T+0.05s  旧 VM 池标记为退役
-T+0.5s   旧 VM 池中最后一个请求完成
-T+0.5s   旧 VM 池安全销毁
-```
-
-整个过程**零停机**，正在执行的请求用旧公式跑完，新请求用新公式。
-
-### 还有一个坑：脚本里的全局状态
-
-Lua 脚本里如果定义了全局变量（比如 `local counter = 0` 在模块级别），热更新后这个状态会丢失。
-
-```lua
--- ❌ 有问题的写法
-local kill_count = 0  -- 模块级全局变量
-
-function on_kill()
-    kill_count = kill_count + 1
-    if kill_count >= 10 then
-        trigger_achievement("first_blood")
-    end
-end
-```
-
-热更新后 `kill_count` 重置为 0，玩家已经杀了 9 个人，再杀一个不触发成就。
-
-解决方案：**有状态的逻辑不放 Lua，只放无状态的计算逻辑**。`kill_count` 这种状态留在 Go 端管理，Lua 只负责算伤害、算时间、算公式。
-
-```
-Lua 负责的（无状态）：
-  - calculate_damage(attacker, defender) → 数字
+Lua 负责的（无状态，安全热更新）：
+  - calculate_power(stats) → 数字
   - building_upgrade_time(level, type) → 数字
-  - resource_output_rate(building_level) → 数字
 
-Go 负责的（有状态）：
-  - 玩家数据、成就计数、任务进度
-  - 战斗中的临时状态（连杀、Buff 持续时间）
-  - 任何需要跨请求持久化的数据
+Go 负责的（有状态，不热更新）：
+  - 玩家数据、成就计数
+  - 战斗中的临时状态
 ```
 
-### 快速回滚
+**问题 3：脚本语法错误**
 
-如果新脚本有 Bug（比如公式算错了），需要立刻回滚。保留旧脚本的路径，一行命令切回去：
-
-```bash
-# 回滚到上一个版本
-curl -X POST http://localhost:8080/api/admin/reload \
-  -d '{"path": "scripts/battle.lua.bak"}'
-```
-
-`Reload` 里的 `atomic.Swap` 保证回滚也是原子的，正在执行的请求不受影响。
-
-## 战斗公式脚本化
-
-```lua
--- scripts/battle.lua
-function calculate_damage(attacker, defender)
-    local base_damage = attacker.attack * (1 - defender.defense / (defender.defense + 100))
-    local crit_chance = attacker.crit_rate / 100
-    local is_crit = math.random() < crit_chance
-    if is_crit then
-        base_damage = base_damage * attacker.crit_damage
-    end
-    return math.floor(base_damage + 0.5)
-end
-
--- 建筑升级时间（秒）
-function building_upgrade_time(level, building_type)
-    local base_time = 60
-    local multiplier = 1.5
-    if building_type == "castle" then
-        multiplier = 2.0  -- 城堡升级更慢
-    end
-    return math.floor(base_time * multiplier ^ (level - 1))
-end
-```
-
-Go 端调用 Lua 函数：
+热更新时新脚本如果有语法错误，直接加载会炸。需要先在临时 VM 里验证语法，通过后再替换。
 
 ```go
-func (e *LuaEnv) CalculateDamage(attacker, defender *Unit) int {
-    e.mu.RLock()
-    defer e.mu.RUnlock()
-
-    L := e.vm
-    fn := L.GetGlobal("calculate_damage")
-    L.Push(fn)
-    L.Push(lua.LNumber(attacker.Attack))
-    L.Push(lua.LNumber(attacker.Defense))
-    L.Push(lua.LNumber(attacker.CritRate))
-    L.Push(lua.LNumber(attacker.CritDamage))
-    L.Push(lua.LNumber(defender.Defense))
-    L.Call(5, 1)
-    return int(L.CheckNumber(-1))
+func validateScript(script string) error {
+    testVM := lua.NewState()
+    defer testVM.Close()
+    return testVM.DoString(script)
 }
 ```
 
-## 为什么不用配置文件？
-
-JSON/YAML 配置文件只能存参数，不能存逻辑。SLG 的战斗公式、建筑规则、科技树依赖关系是**逻辑**，不是参数。
+### 如果要做，设计大概是这样
 
 ```
-配置文件能做的：攻击力 = 100
-配置文件做不到的：如果目标有护盾，先扣护盾再扣血；护盾破碎时触发眩晕效果
+1. /api/admin/reload 接口接收新脚本
+2. 临时 VM 验证语法
+3. 创建新 VM 池，加载新脚本
+4. atomic.Swap 切换到新池
+5. 旧池标记退役，等引用归零后销毁
+6. 新请求用新公式，正在跑的请求用旧公式跑完
 ```
 
-Lua 脚本可以表达条件判断、循环、函数调用，覆盖 SLG 游戏的全部逻辑需求。
+目前还没做，因为战力/等级计算的改动频率不高，重启成本可接受。但如果将来把战斗公式也放 Lua，这就是必须解决的问题。
 
 ## 性能考量
 
-`gopher-lua` 是纯 Go 实现的 Lua 5.1 解释器，性能约为 C Lua 的 1/10~1/5。但对于 SLG 游戏来说足够：
+`gopher-lua` 是纯 Go 实现的 Lua 5.1 解释器，性能约为 C Lua 的 1/10~1/5。对战力/等级计算来说足够——每秒最多几十次调用，单次计算几十行代码，瓶颈在数据库 IO 不在脚本计算。
 
-- 战斗计算频率低（每秒最多几十次）
-- 单次计算量小（几十行 Lua 代码）
-- 瓶颈在数据库 IO，不在脚本计算
+如果未来性能不够：
+1. 热点函数用 Go/Rust 实现，Lua 只做参数调整
+2. 缓存计算结果
+3. 升级到 LuaJIT（需要 CGO，和交叉编译冲突）
 
-如果未来性能不够，可以：
-1. 热点函数用 Go 实现，只把参数调整留给 Lua
-2. 缓存 Lua 函数调用结果
-3. 升级到 LuaJIT（需要 CGO）
-
-> 热更新的价值不是"省一次部署"，是"让策划能独立迭代"。策划改了脚本立刻生效，不需要等程序员排期。
+> 目前 Lua 在项目里是"锦上添花"的角色——Rust 做主力，Lua 做兜底。这个定位决定了热更新暂时不是刚需。但随着脚本化的逻辑越来越多，热更新迟早要做。
