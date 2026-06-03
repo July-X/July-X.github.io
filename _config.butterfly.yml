@@ -71,6 +71,8 @@ darkmode:
   button: true
   default: dark
 
+display_mode: dark
+
 local_search:
   enable: false
 
