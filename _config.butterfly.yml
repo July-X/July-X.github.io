@@ -156,3 +156,6 @@ code_blocks:
   # true: shrink the code blocks | false: expand the code blocks | none: expand code blocks and hide the button
   shrink: false
   fullpage: false
+
+disable_top_img: true
+background: https://i.loli.net/2019/09/09/5oDRkWVKctx2b6A.png
