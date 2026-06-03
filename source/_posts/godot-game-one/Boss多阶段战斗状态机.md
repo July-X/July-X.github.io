@@ -17,6 +17,22 @@ top_img: false
 
 答案是两层状态机。
 
+```mermaid
+stateDiagram-v2
+    [*] --> IDLE
+    IDLE --> CIRCLE: 太远
+    IDLE --> ATTACK: 50%权重
+    IDLE --> RETREAT: 太近
+    CIRCLE --> ATTACK: 计时器到期
+    CIRCLE --> RETREAT: 太近
+    ATTACK --> CIRCLE: 计时器到期
+    ATTACK --> RETREAT: 太近
+    RETREAT --> CIRCLE: 安全距离
+    RETREAT --> ATTACK: 计时器到期
+    IDLE --> ENRAGED: Phase3激活
+    ENRAGED --> ATTACK: 复用逻辑
+```
+
 ## 两层状态，各管各的
 
 ```gdscript
@@ -76,6 +92,19 @@ func _update_phase() -> void:
         _set_phase(BossPhase.OVERLOAD)
     elif hp_ratio <= 0.6:
         _set_phase(BossPhase.RIFT)
+```
+
+阶段切换的血量阈值流程：
+
+```mermaid
+graph TD
+    A[Boss 受伤] --> B{计算 hp_ratio}
+    B -->|> 60%| C[Phase 1: 压制校准]
+    B -->|30%~60%| D[Phase 2: 裂隙展开]
+    B -->|< 30%| E[Phase 3: 核心过载]
+    C -->|稳定射击| F[玩家学习节奏]
+    D -->|攻击频率翻倍| G[压力陡增]
+    E -->|释放补给碎片| H[生死线击杀]
 ```
 
 `_set_phase()` 不切换行为状态，只修改参数字典——射击间隔、移动速度、弹幕模式。行为状态机继续独立运转，但每个 tick 函数读取的参数已经变了。
