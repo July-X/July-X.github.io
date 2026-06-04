@@ -53,6 +53,7 @@ AI:    LangChain / Agent / 多模态生成
 <div style="flex-shrink: 0; width: 280px; background: var(--card-bg); border-radius: 12px; padding: 1.5rem; box-shadow: 0 2px 12px rgba(0,0,0,0.08);">
 
 ### 📍 坐标
+
 🗺️ 四川·成都
 🖥️ MBP (Intel 2019)
 
