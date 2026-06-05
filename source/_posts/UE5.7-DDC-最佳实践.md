@@ -95,16 +95,16 @@ services:
       - "8558:8558"
     volumes:
       - zen_data:/data
-      - zen_s3:/s3-cold  # 冷存储挂载 MinIO
+      - zen_cold:/cold-storage  # 本地冷存储，NAS 大容量盘
     environment:
       ZEN_PORT: "8558"
       ZEN_DATA_PATH: "/data"
-      ZEN_COLD_STORAGE: "s3://zen-archive?endpoint=minio:9000"
+      ZEN_COLD_STORAGE: "/cold-storage"  # 本地 NAS 路径，归档 90 天以上冷数据
     restart: unless-stopped
 
 volumes:
   zen_data:
-  zen_s3:
+  zen_cold:
 ```
 
 启动后验证：
@@ -143,9 +143,10 @@ Shared=(Type=Zen, Host=zen-team.internal, Port=8558,
         WritePolicy="Through",
         ColdStorageFallback=true)
 
-; ── 第三层：S3 冷存储（Zen Server 后端自动管理）
+; ── 第三层：本地冷存储（Zen Server 本地 NAS，自动管理）
 ; 长期归档，90 天未访问自动清理
 ;   特性：配置在 Zen Server 侧，客户端无感知
+;   数据全程不出机房，内网安全可控
 
 ; ═══════════════════════════════════════════
 ; Root 节点从本地查起，一级级 fallback
@@ -160,13 +161,13 @@ Root=(Type=Hierarchical, Heuristics=Manual,
 查询路径（读）：
   Local Zen (50GB, NVMe, ~0.1ms)
     → Miss → Shared Zen (无限, LAN, ~2ms)
-      → Miss → Cold S3 (无限, ~50ms)
+      → Miss → 本地冷存储 (NAS, ~5ms)
         → Miss → 重新计算 ← 成本高，要避免
 
 写入路径（写）：
   重新计算 → 写入 Local Zen (write-through)
     → 同步写入 Shared Zen (write-through)
-      → Zen Server 异步归档到 S3 冷存储
+      → Zen Server 异步归档到本地冷存储
 ```
 
 ---
@@ -226,7 +227,7 @@ UnrealZen import                          \
 
 ```
 ✅ Agent #1 ──┐
-✅ Agent #2 ──┼── Shared Zen Server ──→ Cold S3
+✅ Agent #2 ──┼── Shared Zen Server ──→ 本地冷存储 NAS
 ✅ Agent #3 ──┘
 ```
 
@@ -276,7 +277,7 @@ UE5Editor.exe MyProject.uproject -DDC-ShowStats
 # DDC Stats:
 #   Local Zen:        23,451 hits,    142 misses  (99.4% hit rate)
 #   Shared Zen:          138 hits,      4 misses  (  .   )
-#   Cold S3:               2 hits,      2 misses  (  .   )
+#   Cold Storage:         2 hits,      2 misses  (  .   )
 #   Total compute:         2 new derivations
 #   Total time saved: ~47 minutes
 ```
@@ -301,7 +302,7 @@ scrape_configs:
 | `zen_cache_hit_rate` | 缓存命中率 | < 80% |
 | `zen_cache_size_bytes` | 缓存占用 | > 磁盘 80% |
 | `zen_request_latency_p99` | P99 延迟 | > 10ms |
-| `zen_cold_storage_fallback_rate` | 回退到冷存储的比例 | > 5% 说明热数据被淘汰 |
+| `zen_cold_storage_fallback_rate` | 回退到本地冷存储的比例 | > 5% 说明热数据被淘汰 |
 
 **常见问题诊断**：
 
@@ -325,7 +326,7 @@ ZenServer.exe --gc-now        # 手动触发 GC
 
 > "我们把 Zen Server 部署在阿里云上，整个团队 VPN 连过去。"
 
-结果：gRPC 延迟 30ms+，每次 DDC 查询比本地计算还慢。**Zen 必须和 Editor/CI Agent 在同一局域网内，延迟 < 2ms。**
+结果：gRPC 延迟 30ms+，每次 DDC 查询比本地计算还慢。而且项目资产通过公网传输，安全风险不可控。**Zen 必须部署在本地机房，和 Editor/CI Agent 在同一局域网内，延迟 < 2ms。所有数据不出机房。**
 
 **错误二：不设 Local Zen 上限**
 

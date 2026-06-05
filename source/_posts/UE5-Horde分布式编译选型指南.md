@@ -76,7 +76,7 @@ graph TD
     CI["CI 触发 Jenkins/GitLab"] --> HS["Horde Server"]
     subgraph "Horde Server"
         HS --> DB["MongoDB 主库"]
-        HS --> ART["Artifact Storage MinIO S3"]
+        HS --> ART["Artifact Storage 本地 MinIO"]
     end
     HS --> A1["Agent Win64 #1"]
     HS --> A2["Agent Win64 #2"]
@@ -138,6 +138,8 @@ BuildGraph 脚本是这套系统的灵魂。一个合格的模板大概是这样
 
 另一个坑：**RAM**。UE5 全量编译的链接阶段能吃 50-80GB 内存。如果 agent 只有 32GB，链接时 OOM 是迟早的事。
 
+> 以上所有存储都基于本地机房 NAS，不依赖任何云服务。数据全程不出机房，网络延迟可控，安全性可控。
+
 ## 最被低估的问题：分布式编译不能解决什么
 
 搭分布式编译最大的误区，是以为"多机 = 快"。但实际项目里，编译往往不是瓶颈：
@@ -161,7 +163,7 @@ Shader 和 Cook 占了整体时间的大头，但它们很难跨机器分发。S
 | 3-5 人，编译 20 分钟内 | 先优化 DDC 和 Unity Build，可能不需要分布式 |
 | 5-10 人，C++ 编译瓶颈 | FASTBuild + 2-3 台 agent |
 | 10-50 人，需要 CI 流水线 | Horde 全套 |
-| 50+ 人，AAA 项目 | Horde + Zen Server + 云弹性扩容 |
+| 50+ 人，AAA 项目 | Horde + Zen Server |
 
 ---
 
