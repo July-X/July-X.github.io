@@ -100,7 +100,7 @@ enabled = true   # language server tools; servers launch lazily when used
 # Rules are "Tool" or "Tool(specifier)"; e.g. Bash(go test:*), Edit(src/**).
 mode  = "ask"
 # deny = ["Bash(rm -rf*)", "Bash(git push*)"]   # hard-blocked in every mode
-allow = ["mcp__drawio__list_pages", "mcp__drawio__create_new_diagram", "mcp__drawio__export_diagram", "mcp__drawio__get_diagram", "mcp__drawio__start_session", "Bash(cd /Users/zhongxingxing/2026/code/izzy.github.io && git add -A && git commit -m \"fix: 重新生成雷达图和热力图，缩小尺寸提升清晰度\")"]
+allow = ["mcp__drawio__list_pages", "mcp__drawio__create_new_diagram", "mcp__drawio__export_diagram", "mcp__drawio__get_diagram", "mcp__drawio__start_session", "Bash(cd /Users/zhongxingxing/2026/code/izzy.github.io && git add -A && git commit -m \"fix: 重新生成雷达图和热力图，缩小尺寸提升清晰度\")", "Bash(cd /Users/zhongxingxing/2026/code/izzy.github.io && git log --oneline -3)"]
 # ask = ["Edit(src/**)"]   # force a prompt even if otherwise allowed
 
 [sandbox]
